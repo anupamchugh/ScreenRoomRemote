@@ -2,6 +2,10 @@
 
 A local macOS prototype for controlling a compatible Fire OS device, looking up films and chatting about movies. Built with SwiftUI, App Intents and Apple Foundation Models.
 
+![Screen Room Remote macOS home screen preview](docs/images/remote-home-macos.png)
+
+*Early home screen preview; the current app also shows TV playback and volume controls.*
+
 ![Movie Chat on macOS showing a movie-night suggestion](docs/images/movie-chat-macos.png)
 
 ## What works
