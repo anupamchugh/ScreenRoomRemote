@@ -2,6 +2,12 @@
 
 A local macOS prototype for controlling a compatible Fire OS device, looking up films and chatting about movies. Built with SwiftUI, App Intents and Apple Foundation Models.
 
+![Screen Room Remote macOS home screen preview](docs/images/remote-home-macos.png)
+
+*Early home screen preview; the current app also shows TV playback and volume controls.*
+
+![Movie Chat on macOS showing a movie-night suggestion](docs/images/movie-chat-macos.png)
+
 ## What works
 
 - Home, Back, directional, Select, Play/Pause, Resume, Forward and volume-key commands over a paired ADB connection. TV and audio hardware support varies.
@@ -9,7 +15,7 @@ A local macOS prototype for controlling a compatible Fire OS device, looking up 
 - Film search using the bundled Screen Room catalog. Add your own TMDB API key or v4 read token in the search sheet to use the live catalog; the app stores it in macOS Keychain. The film query is sent to TMDB. Without a key, three sample films are available.
 - A Now Playing panel reads the active media session reported by the TV; it does not infer titles from images. Refresh is manual.
 - Text chat using Apple Foundation Models on a supported Mac with Apple Intelligence enabled. The Movie Night button runs a bounded local ModelRelay workflow over catalog candidates and checks the chosen title against them; it does not control the TV or guarantee a good match. A movie-search tool may send a query to TMDB; a separate read-only TV tool can report the currently selected TV media session. The interface reports which source was used. Model answers can be inaccurate.
-- A read-only TV connection App Shortcut with an interactive refresh card. Siri discovery and presentation have not yet been verified.
+- A TV connection App Shortcut with an interactive refresh card, plus pause, resume and toggle-mute shortcuts. Siri discovery and execution have not yet been verified. Chat accepts a small set of exact remote commands, including “pause”, “resume”, “volume up”, “volume down” and “toggle mute”. A sent command does not prove that playback or audio changed.
 
 Catalog results do not establish streaming availability. Netflix may block screenshots. Opening Netflix does not automatically select a film. Voice chat, Focus, YouTube browsing-history import and cross-device iOS handoff are not implemented.
 
