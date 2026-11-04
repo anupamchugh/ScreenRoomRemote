@@ -6,6 +6,9 @@ import Security
     @Published var query = ""
     @Published var credential = ""
     @Published var results: [FilmSummary] = []
+    @Published var featured: [FilmSummary] = []
+    @Published var featuredStatus = "Loading films…"
+    @Published var isLoadingFeatured = false
     @Published var message = "Sample catalog: Arrival, Casablanca and Spirited Away."
     @Published var isLoading = false
     @Published var showing = false
@@ -22,6 +25,23 @@ import Security
         }
     }
 
+    func loadFeatured() {
+        guard !isLoadingFeatured else { return }
+        isLoadingFeatured = true
+        let configured = activeCredential
+        let catalog: any FilmCatalog = configured.map { TMDBClient(credential: $0) } ?? SampleCatalog()
+        Task {
+            do {
+                let found = try await catalog.films(on: .trending)
+                featured = Array(found.prefix(4))
+                featuredStatus = configured == nil ? "Screen Room sample catalog" : "Trending films · TMDB"
+            } catch {
+                featured = []
+                featuredStatus = "Couldn’t load films. Open Search to check your catalog settings."
+            }
+            isLoadingFeatured = false
+        }
+    }
     func saveCredential() {
         let trimmed = credential.trimmingCharacters(in: .whitespacesAndNewlines)
         guard TMDBCredential(configuredValue: trimmed) != nil, let data = trimmed.data(using: .utf8) else { keyMessage = "Enter a TMDB key first."; return }
@@ -31,7 +51,7 @@ import Security
             var item = query; item[kSecValueData as String] = data
             status = SecItemAdd(item as CFDictionary, nil)
         }
-        if status == errSecSuccess { savedCredential = trimmed; credential = ""; keyMessage = "Key saved in Keychain. Search to verify it." }
+        if status == errSecSuccess { savedCredential = trimmed; credential = ""; keyMessage = "Key saved in Keychain. Search to verify it."; loadFeatured() }
         else { keyMessage = "Could not save the key in Keychain (\(status))." }
     }
 

@@ -1,11 +1,126 @@
 import SwiftUI
 import FoundationModels
+import Observation
 import ScreenRoomKit
+import ModelRelay
 
 struct ChatMessage: Identifiable {
     let id = UUID()
     let isUser: Bool
     let text: String
+}
+
+/// WWDC 2026 Session 242: Drops intermediate `.toolCalls` and `.toolOutput` entries from
+/// already-completed turns so the 4,096-token on-device context window stays lean.
+@available(macOS 27.0, *)
+struct DroppingToolCallsProfileModifier: LanguageModelSession.DynamicProfileModifier {
+    func body(content: Content) -> some LanguageModelSession.DynamicProfile {
+        content.historyTransform { history in
+            var kept: [Transcript.Entry] = []
+            for entry in history.reversed() {
+                switch entry {
+                case .toolCalls, .toolOutput:
+                    if !kept.contains(where: { if case .response = $0 { return true } else { return false } }) {
+                        kept.append(entry)
+                    }
+                default:
+                    kept.append(entry)
+                }
+            }
+            return kept.reversed()
+        }
+    }
+}
+
+/// WWDC 2026 Session 242: Observable state driving `DynamicProfile` mode & tool-call loop escape.
+@available(macOS 27.0, *)
+@Observable
+final class ScreenRoomSessionState: @unchecked Sendable {
+    enum SpecialistMode: String, Sendable {
+        case concierge = "Film Concierge"
+        case tvInspector = "TV Session Inspector"
+    }
+    var mode: SpecialistMode = .concierge
+    var toolCallsThisTurn: Int = 0
+}
+
+/// WWDC 2026 Session 242: DynamicProfile orchestrating Film Concierge + TV Session Inspector
+/// with `.toolCallingMode` loop escape and `DroppingToolCallsProfileModifier`.
+@available(macOS 27.0, *)
+struct ScreenRoomOrchestratorProfile: LanguageModelSession.DynamicProfile {
+    let state: ScreenRoomSessionState
+    let credential: TMDBCredential?
+    let tvAddress: String?
+    let trace: MovieSearchTrace
+
+    var body: some LanguageModelSession.DynamicProfile {
+        Profile {
+            Instructions {
+                """
+                You are a concise film conversation assistant in Screen Room Remote. Suggest films and discuss movies.
+                For film title searches, use the movie search tool and clearly identify results as catalog information. The tool may send a title query to TMDB.
+                For comparing two or more candidate films in depth, use the catalog critic friend tool so its scratch work stays outside the main conversation.
+                For a question about what is playing on the Fire TV, use the TV now-playing tool and report only what it returns.
+                You cannot otherwise browse the web, see the TV screen, access Netflix, check streaming availability, sign in, or control playback.
+                Never claim you did those things. Treat availability as unknown. Do not invent current listings.
+                """
+            }
+            MovieSearchTool(credential: credential, trace: trace)
+            TVNowPlayingTool(address: tvAddress, trace: trace)
+            CatalogCriticFriendTool(credential: credential, trace: trace)
+        }
+        .toolCallingMode(state.toolCallsThisTurn >= 2 ? .disallowed : .allowed)
+        .onPrompt { _ in
+            state.toolCallsThisTurn = 0
+        }
+        .onToolCall { call in
+            state.toolCallsThisTurn += 1
+            if call.toolName == "tvNowPlaying" {
+                state.mode = .tvInspector
+            } else {
+                state.mode = .concierge
+            }
+            await trace.recordTool(call.toolName)
+        }
+        .modifier(DroppingToolCallsProfileModifier())
+    }
+}
+
+/// WWDC 2026 Session 242 ("Phone-a-Friend"): Spawns an isolated specialist `LanguageModelSession`
+/// to compare catalog candidates and returns only the distilled comparison string to the parent session.
+@available(macOS 26.0, *)
+struct CatalogCriticFriendTool: Tool {
+    let name = "consultCatalogCritic"
+    let description = "Consult an on-device film critic subagent to compare two film titles from the Screen Room catalog without cluttering the main chat."
+    let credential: TMDBCredential?
+    let trace: MovieSearchTrace
+
+    @Generable struct Arguments {
+        @Guide(description: "First film title to compare")
+        var firstTitle: String
+        @Guide(description: "Second film title to compare")
+        var secondTitle: String
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        await trace.recordTool("consultCatalogCritic")
+        let catalog: any FilmCatalog = credential.map { TMDBClient(credential: $0) } ?? SampleCatalog()
+        let firstHits = (try? await catalog.search(arguments.firstTitle)) ?? []
+        let secondHits = (try? await catalog.search(arguments.secondTitle)) ?? []
+        await trace.mark(credential == nil ? "the sample catalog" : "TMDB")
+        guard let first = firstHits.first, let second = secondHits.first else {
+            return "Catalog critic could not find both titles in \(credential == nil ? "the sample catalog" : "TMDB")."
+        }
+        let subSession = LanguageModelSession(instructions: """
+            You are a concise film pairing critic. Compare the two supplied catalog films in at most two sentences using only their provided overviews. Never claim streaming availability.
+            """)
+        let prompt = """
+            Film 1: \(first.title) (\(first.year ?? "year unknown")) — \(first.overview.prefix(240))
+            Film 2: \(second.title) (\(second.year ?? "year unknown")) — \(second.overview.prefix(240))
+            """
+        let response = try await subSession.respond(to: prompt)
+        return response.content
+    }
 }
 
 @MainActor final class MovieChat: ObservableObject {
@@ -14,12 +129,19 @@ struct ChatMessage: Identifiable {
     @Published var isResponding = false
     @Published var error: String?
     @Published var sourceNotice: String?
+    @Published var toolsUsed: [String] = []
+    @Published var activeSpecialist: String = "Film Concierge"
     private let trace = MovieSearchTrace()
     private var modelSession: Any?
+    private var sessionState: Any?
+    private var responseTask: Task<Void, Never>?
     private var credential: TMDBCredential?
+    private var tvAddress: String?
 
-    func configure(credential: TMDBCredential?) {
-        if self.credential != credential { self.credential = credential; modelSession = nil }
+    func configure(credential: TMDBCredential?, tvAddress: String?) {
+        if self.credential != credential || self.tvAddress != tvAddress {
+            self.credential = credential; self.tvAddress = tvAddress; modelSession = nil; sessionState = nil
+        }
     }
 
     var availability: String {
@@ -37,38 +159,136 @@ struct ChatMessage: Identifiable {
         guard #available(macOS 26.0, *) else { return false }
         return SystemLanguageModel.default.availability == .available && !isResponding && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
+    func stop() {
+        responseTask?.cancel()
+        responseTask = nil
+        isResponding = false
+    }
     func send() {
         guard #available(macOS 26.0, *), canSend else { return }
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        draft = ""; error = nil; sourceNotice = nil; isResponding = true
+        draft = ""; error = nil; sourceNotice = nil; toolsUsed = []; isResponding = true
         messages.append(ChatMessage(isUser: true, text: prompt))
+        if let action = TVRemoteAction.explicitRequest(prompt) {
+            let address = tvAddress ?? ""
+            responseTask = Task {
+                let sent = await action.send(address: address)
+                guard !Task.isCancelled else { return }
+                let message = sent ? (action == .toggleMute ? "Mute toggle sent. Check your TV audio." : "TV command sent. Check the TV for the result.") : "Couldn’t send the command. Check the TV connection."
+                messages.append(ChatMessage(isUser: false, text: message))
+                toolsUsed = ["adb:\(action.rawValue)"]
+                isResponding = false
+                responseTask = nil
+            }
+            return
+        }
         let session: LanguageModelSession
-        if let existing = modelSession as? LanguageModelSession { session = existing }
-        else {
-            session = LanguageModelSession(tools: [MovieSearchTool(credential: credential, trace: trace)], instructions: """
+        if let existing = modelSession as? LanguageModelSession {
+            session = existing
+        } else if #available(macOS 27.0, *) {
+            let state = ScreenRoomSessionState()
+            sessionState = state
+            let profile = ScreenRoomOrchestratorProfile(state: state, credential: credential, tvAddress: tvAddress, trace: trace)
+            session = LanguageModelSession(profile: profile)
+            modelSession = session
+        } else {
+            session = LanguageModelSession(tools: [MovieSearchTool(credential: credential, trace: trace), TVNowPlayingTool(address: tvAddress, trace: trace), CatalogCriticFriendTool(credential: credential, trace: trace)], instructions: """
                 You are a concise film conversation assistant in Screen Room Remote. Suggest films and discuss movies.
-                For film title searches, use the movie search tool and clearly identify results as catalog information. The tool may send a title query to TMDB. You cannot otherwise browse the web, see the TV, access Netflix, check current availability, sign in, or control playback.
+                For film title searches, use the movie search tool and clearly identify results as catalog information. The tool may send a title query to TMDB. For a question about what is playing, use the TV now-playing tool and report only what it returns. You cannot otherwise browse the web, see the TV screen, access Netflix, check streaming availability, sign in, or control playback.
                 Never claim you did those things. Treat availability as unknown. Do not invent current listings.
                 """)
             modelSession = session
         }
-        Task {
+        responseTask = Task {
             await trace.reset()
             do {
                 let answer = try await session.respond(to: prompt)
+                guard !Task.isCancelled else { return }
                 messages.append(ChatMessage(isUser: false, text: answer.content))
-                if let source = await trace.source { sourceNotice = "Searched \(source). Streaming availability is unknown." }
-            } catch { self.error = "Chat couldn’t respond: \(error.localizedDescription)" }
+                if let source = await trace.source { sourceNotice = "Source: \(source). Streaming availability is unknown." }
+                toolsUsed = await trace.tools
+                if #available(macOS 27.0, *), let state = sessionState as? ScreenRoomSessionState {
+                    activeSpecialist = state.mode.rawValue
+                }
+            } catch is CancellationError {
+                self.error = "Stopped."
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.error = "Chat couldn’t respond: \(error.localizedDescription)"
+            }
             isResponding = false
+            responseTask = nil
         }
     }
-    func clear() { guard !isResponding else { return }; messages = []; modelSession = nil; error = nil; sourceNotice = nil }
+    /// Select only from catalog titles; the model never gets to invent a recommendation.
+    func planMovieNight() {
+        guard #available(macOS 26.0, *), !isResponding else { return }
+        guard SystemLanguageModel.default.availability == .available else {
+            error = "Apple Intelligence is unavailable on this Mac."
+            return
+        }
+        let preference = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = preference.isEmpty ? "a light movie night" : preference
+        let configured = credential
+        draft = ""; error = nil; sourceNotice = nil; toolsUsed = []; isResponding = true
+        messages.append(ChatMessage(isUser: true, text: "Movie night: " + request))
+        responseTask = Task {
+            do {
+                let catalog: any FilmCatalog = configured.map { TMDBClient(credential: $0) } ?? SampleCatalog()
+                let films = try await catalog.films(on: configured == nil ? .trending : .popular)
+                guard !Task.isCancelled else { return }
+                let candidates = Array(films.prefix(12))
+                guard !candidates.isEmpty else { throw MovieNightFailure.noCandidates }
+                let candidateLines = candidates.map { film in
+                    let context = String(film.overview.prefix(320)).replacingOccurrences(of: "\n", with: " ")
+                    return "- \(film.title): \(context)"
+                }
+                let workflow = Workflow("Movie night", output: "result") {
+                    Step.prompt("suggestion", "Choose a film from the candidate list that fits the preference. If none fits, return NO_MATCH. Otherwise return ONLY its exact title, with no explanation or punctuation. Never invent a title. {{input}}", model: .appleOnDevice).withPolicy(.localOnly)
+                    Step.template("result", "{{suggestion}}")
+                }
+                let input = "Preference: \(request)\nCandidates (title and description):\n" + candidateLines.joined(separator: "\n")
+                let execution = WorkflowExecutor().execute(workflow, input: .text(input), limits: .init(maxModelCalls: 1, maxToolCalls: 0, maxConcurrentSteps: 1))
+                let report = try await execution.result
+                guard !Task.isCancelled else { return }
+                let output = report.output.textValue.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”"))
+                if output.uppercased() == "NO_MATCH" { throw MovieNightFailure.noMatch }
+                guard let selected = candidates.first(where: { $0.title.caseInsensitiveCompare(output) == .orderedSame }) else { throw MovieNightFailure.ungrounded }
+                messages.append(ChatMessage(isUser: false, text: "Try \(selected.title)" + (selected.year.map { " (\($0))" } ?? "") + "."))
+                sourceNotice = configured == nil ? "Screen Room sample catalog · streaming availability unknown" : "TMDB catalog · streaming availability unknown"
+                toolsUsed = ["workflow:MovieNight", configured == nil ? "SampleCatalog" : "TMDBClient"]
+            } catch is CancellationError {
+                self.error = "Stopped."
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.error = (error as? MovieNightFailure)?.localizedDescription ?? (error as? ScreenRoomError)?.localizedDescription ?? "Couldn’t plan movie night. Check the connection and try again."
+            }
+            isResponding = false
+            responseTask = nil
+        }
+    }
+    func clear() { guard !isResponding else { return }; messages = []; modelSession = nil; sessionState = nil; error = nil; sourceNotice = nil; toolsUsed = [] }
+}
+
+private enum MovieNightFailure: LocalizedError {
+    case noCandidates, noMatch, ungrounded
+    var errorDescription: String? {
+        switch self {
+        case .noCandidates: "The film catalog returned no candidates."
+        case .noMatch: "No close match among the current catalog picks. Try a different preference."
+        case .ungrounded: "The model did not choose a catalog title. Try again."
+        }
+    }
 }
 
 actor MovieSearchTrace {
     private(set) var source: String?
-    func reset() { source = nil }
+    private(set) var tools: [String] = []
+    func reset() { source = nil; tools = [] }
     func mark(_ source: String) { self.source = source }
+    func recordTool(_ name: String) {
+        if !tools.contains(name) { tools.append(name) }
+    }
 }
 
 @available(macOS 26.0, *)
@@ -84,12 +304,34 @@ struct MovieSearchTool: Tool {
     }
 
     func call(arguments: Arguments) async throws -> String {
+        await trace.recordTool("searchMovies")
         let catalog: any FilmCatalog = credential.map { TMDBClient(credential: $0) } ?? SampleCatalog()
         let results = try await catalog.search(arguments.title)
         await trace.mark(credential == nil ? "the sample catalog" : "TMDB")
         guard !results.isEmpty else { return credential == nil ? "No matches in the three-film sample catalog." : "No matching films in TMDB." }
         let titles = results.prefix(5).map { $0.title + ($0.year.map { " (\($0))" } ?? "") }.joined(separator: "; ")
         return "\(credential == nil ? "Sample catalog" : "TMDB") results: \(titles). Streaming availability is unknown."
+    }
+}
+
+@available(macOS 26.0, *)
+struct TVNowPlayingTool: Tool {
+    let name = "tvNowPlaying"
+    let description = "Read the connected Fire TV's active title and playback state."
+    let address: String?
+    let trace: MovieSearchTrace
+    @Generable struct Arguments {
+        @Guide(description: "Whether to include the current playback state")
+        var includePlaybackState: Bool
+    }
+    func call(arguments: Arguments) async throws -> String {
+        await trace.recordTool("tvNowPlaying")
+        guard let address, let playing = await TVMediaSession.read(address: address) else {
+            await trace.mark("Fire TV media session")
+            return "No active title could be read from the Fire TV. Do not guess."
+        }
+        await trace.mark("Fire TV media session")
+        return "TV reports: \(playing.title). Playback: \(playing.state)."
     }
 }
 
@@ -100,10 +342,21 @@ struct MovieChatView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Movie Chat").font(.title2.bold())
+                    HStack(spacing: 8) {
+                        Text("Movie Chat").font(.title2.bold())
+                        Text(chat.activeSpecialist)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(.white.opacity(0.10), in: Capsule())
+                    }
                     Text(chat.availability).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                if chat.isResponding {
+                    Button("Stop", role: .destructive) { chat.stop() }
+                }
+                Button("Movie Night") { chat.planMovieNight() }.disabled(chat.isResponding)
                 Button("New Chat") { chat.clear() }.disabled(chat.isResponding)
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }
@@ -112,7 +365,7 @@ struct MovieChatView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         if chat.messages.isEmpty {
-                            Text("Ask for a film suggestion or talk about a movie. A film search may send your query to TMDB. Chat can’t see Netflix or verify streaming availability.")
+                            Text("Ask for a film suggestion, compare two titles, or talk about a movie. A film search may send your query to TMDB. Chat can read the TV’s reported title and send simple commands such as “pause” or “resume”. Mute is a toggle. It cannot verify streaming availability.")
                                 .foregroundStyle(.secondary).padding(.vertical, 16)
                         }
                         ForEach(chat.messages) { message in
@@ -126,6 +379,18 @@ struct MovieChatView: View {
                         if chat.isResponding { ProgressView("Thinking…").padding(8) }
                     }.padding(2)
                 }.onChange(of: chat.messages.count) { if let id = chat.messages.last?.id { proxy.scrollTo(id, anchor: .bottom) } }
+            }
+            if !chat.toolsUsed.isEmpty {
+                HStack(spacing: 6) {
+                    Label("Tools used:", systemImage: "wrench.and.screwdriver").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                    ForEach(chat.toolsUsed, id: \.self) { tool in
+                        Text(tool)
+                            .font(.caption2.monospaced())
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.white.opacity(0.08), in: Capsule())
+                    }
+                }
             }
             if let source = chat.sourceNotice { Label(source, systemImage: "checkmark.circle").font(.caption).foregroundStyle(.secondary) }
             if let error = chat.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }

@@ -5,6 +5,9 @@ options:
 packages:
   ScreenRoomKit:
     path: Vendor/ScreenRoomKit
+  ModelRelay:
+    url: https://github.com/Juanpe/ModelRelay.git
+    exactVersion: 0.2.0
 targets:
   ScreenRoomRemote:
     type: application
@@ -14,11 +17,14 @@ targets:
     dependencies:
       - package: ScreenRoomKit
         product: ScreenRoomKit
+      - package: ModelRelay
+        product: ModelRelay
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screenroom.remote
         PRODUCT_NAME: Screen Room Remote
         GENERATE_INFOPLIST_FILE: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGNING_ALLOWED: NO
         SWIFT_VERSION: 5.0
         MACOSX_DEPLOYMENT_TARGET: 27.0
