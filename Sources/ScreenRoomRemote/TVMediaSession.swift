@@ -1,9 +1,26 @@
 import Foundation
+import FoundationModels
 
-struct TVNowPlaying: Sendable, Equatable {
+struct TVNowPlaying: Sendable, Equatable, PromptRepresentable, InstructionsRepresentable {
     let title: String
     let artist: String?
     let state: String
+
+    var promptRepresentation: Prompt {
+        Prompt {
+            "TV reports: \(title)"
+            if let artist, !artist.isEmpty {
+                "Artist/Channel: \(artist)"
+            }
+            "Playback: \(state)"
+        }
+    }
+
+    var instructionsRepresentation: Instructions {
+        Instructions {
+            "Active Fire TV media session: \(title) (\(state))."
+        }
+    }
 }
 
 enum TVMediaSession {
