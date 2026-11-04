@@ -67,6 +67,22 @@ private let assetBundle = Bundle.main
             self.message = error == nil ? "Command sent" : "Couldn’t send command: \(error ?? "unknown error")"
         }
     }
+    func openYouTube() {
+        guard connected else { message = "Connect the TV before opening YouTube."; return }
+        run(["-s", address + ":5555", "shell", "monkey", "-p", "com.amazon.firetv.youtube", "1"]) { data, error in
+            let response = String(data: data ?? Data(), encoding: .utf8) ?? ""
+            self.message = error == nil && response.contains("Events injected: 1") ? "YouTube launch requested" : "Couldn’t open YouTube on this TV."
+        }
+    }
+    func openYouTubeVideo(_ link: String) {
+        guard connected else { message = "Connect the TV before opening a video."; return }
+        guard let id = YouTubeLink.videoID(link) else { message = "Enter a YouTube watch or youtu.be link."; return }
+        let url = "https://youtu.be/" + id
+        run(["-s", address + ":5555", "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url, "com.amazon.firetv.youtube"]) { data, error in
+            let response = String(data: data ?? Data(), encoding: .utf8) ?? ""
+            self.message = error == nil && !response.contains("Error:") ? "Video link sent to YouTube; check the TV." : "YouTube couldn’t open that link."
+        }
+    }
     func capture() {
         guard connected else { message = "Connect the TV before capturing its screen."; return }
         message = "Getting TV screen…"
@@ -88,12 +104,23 @@ private let assetBundle = Bundle.main
 struct ContentView: View {
     @EnvironmentObject var tv: TV
     @State private var search = ""
+    @State private var youtubeLink = ""
+    @State private var showYouTube = false
     @StateObject private var films = FilmSearch()
     @StateObject private var chat = MovieChat()
     @State private var showingChat = false
     private let panels: [(String,String,String)] = [("comedy","Feel-Good Comedies","Light, funny, and uplifting"),("romance","Romantic Comedies","Love, laughs, and happily ever after"),("escape","Escape & Dream","Feel-good stories in beautiful places"),("notable","New & Notable","Fresh picks to watch now")]
     var body: some View {
         HStack(spacing: 0) { sidebar; main }.background(Color(red: 0.15, green: 0.105, blue: 0.15)).foregroundStyle(.white)
+        .sheet(isPresented: $showYouTube) {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("YouTube on Fire TV").font(.title2.bold())
+                Text("Open YouTube or send a specific video link to the TV. Availability and playback depend on YouTube.").foregroundStyle(.secondary)
+                TextField("https://www.youtube.com/watch?v=…", text: $youtubeLink).textFieldStyle(.roundedBorder)
+                HStack { Button("Open YouTube") { tv.openYouTube(); showYouTube = false }; Button("Open Video") { tv.openYouTubeVideo(youtubeLink); showYouTube = false }.disabled(YouTubeLink.videoID(youtubeLink) == nil); Spacer(); Button("Done") { showYouTube = false } }
+                Text("Your browsing history is not connected.").font(.caption).foregroundStyle(.secondary)
+            }.padding(24).frame(width: 530)
+        }
         .sheet(isPresented: $films.showing) { FilmSearchView(films: films).environmentObject(tv) }
         .sheet(isPresented: $showingChat) { MovieChatView(chat: chat) }
         .sheet(isPresented: $tv.showingScreen) { VStack(alignment: .trailing) { Button("Done") { tv.showingScreen = false }; if let image = tv.screenshot { Image(nsImage: image).resizable().scaledToFit() } }.padding().frame(minWidth: 720, minHeight: 450) }
@@ -125,6 +152,7 @@ struct ContentView: View {
                 TextField("TV address",text:$tv.address).textFieldStyle(.roundedBorder).frame(width:125).onChange(of: tv.address) { tv.connected = false; tv.message = "Address changed. Select Connect." }.onSubmit { tv.connect() }
                 Button("Connect") { tv.connect() }.buttonStyle(.bordered)
                 Button("Netflix") { tv.openNetflix() }.buttonStyle(.bordered)
+                Button("YouTube") { showYouTube = true }.buttonStyle(.bordered)
                 Button { tv.capture() } label: { Label("See TV",systemImage:"tv") }.buttonStyle(.borderedProminent).tint(Color(red:0.48,green:0.32,blue:0.43))
             }.padding(18).background(.white.opacity(0.035),in:RoundedRectangle(cornerRadius:18)).overlay(RoundedRectangle(cornerRadius:18).stroke(.white.opacity(0.07)))
             HStack { Image(systemName:"magnifyingglass"); TextField("Search film titles",text:$search).textFieldStyle(.plain).onSubmit { films.query = search; films.showing = true; films.search() }; Button("Search") { films.query = search; films.showing = true; films.search() }.buttonStyle(.plain).font(.subheadline.bold()) }.font(.system(size:19)).padding(16).background(Color(red:0.25,green:0.18,blue:0.24),in:RoundedRectangle(cornerRadius:20)).overlay(RoundedRectangle(cornerRadius:20).stroke(.pink.opacity(0.45)))
