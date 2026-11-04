@@ -1,0 +1,6 @@
+.build/
+build/
+build.log
+dist/
+*.xcodeproj/
+.DS_Store
