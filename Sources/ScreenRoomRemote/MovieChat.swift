@@ -1,6 +1,7 @@
 import SwiftUI
 import FoundationModels
 import ScreenRoomKit
+import ModelRelay
 
 struct ChatMessage: Identifiable {
     let id = UUID()
@@ -17,9 +18,12 @@ struct ChatMessage: Identifiable {
     private let trace = MovieSearchTrace()
     private var modelSession: Any?
     private var credential: TMDBCredential?
+    private var tvAddress: String?
 
-    func configure(credential: TMDBCredential?) {
-        if self.credential != credential { self.credential = credential; modelSession = nil }
+    func configure(credential: TMDBCredential?, tvAddress: String?) {
+        if self.credential != credential || self.tvAddress != tvAddress {
+            self.credential = credential; self.tvAddress = tvAddress; modelSession = nil
+        }
     }
 
     var availability: String {
@@ -35,19 +39,30 @@ struct ChatMessage: Identifiable {
     }
     var canSend: Bool {
         guard #available(macOS 26.0, *) else { return false }
-        return SystemLanguageModel.default.availability == .available && !isResponding && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !isResponding && !text.isEmpty && (TVRemoteAction.explicitRequest(text) != nil || SystemLanguageModel.default.availability == .available)
     }
     func send() {
         guard #available(macOS 26.0, *), canSend else { return }
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         draft = ""; error = nil; sourceNotice = nil; isResponding = true
         messages.append(ChatMessage(isUser: true, text: prompt))
+        if let action = TVRemoteAction.explicitRequest(prompt) {
+            let address = tvAddress ?? ""
+            Task {
+                let sent = await action.send(address: address)
+                let message = sent ? (action == .toggleMute ? "Mute toggle sent. Check your TV audio." : "TV command sent. Check the TV for the result.") : "Couldn’t send the command. Check the TV connection."
+                messages.append(ChatMessage(isUser: false, text: message))
+                isResponding = false
+            }
+            return
+        }
         let session: LanguageModelSession
         if let existing = modelSession as? LanguageModelSession { session = existing }
         else {
-            session = LanguageModelSession(tools: [MovieSearchTool(credential: credential, trace: trace)], instructions: """
+            session = LanguageModelSession(tools: [MovieSearchTool(credential: credential, trace: trace), TVNowPlayingTool(address: tvAddress, trace: trace)], instructions: """
                 You are a concise film conversation assistant in Screen Room Remote. Suggest films and discuss movies.
-                For film title searches, use the movie search tool and clearly identify results as catalog information. The tool may send a title query to TMDB. You cannot otherwise browse the web, see the TV, access Netflix, check current availability, sign in, or control playback.
+                For film title searches, use the movie search tool and clearly identify results as catalog information. The tool may send a title query to TMDB. For a question about what is playing, use the TV now-playing tool and report only what it returns. You cannot otherwise browse the web, see the TV screen, access Netflix, check streaming availability, sign in, or control playback.
                 Never claim you did those things. Treat availability as unknown. Do not invent current listings.
                 """)
             modelSession = session
@@ -57,18 +72,70 @@ struct ChatMessage: Identifiable {
             do {
                 let answer = try await session.respond(to: prompt)
                 messages.append(ChatMessage(isUser: false, text: answer.content))
-                if let source = await trace.source { sourceNotice = "Searched \(source). Streaming availability is unknown." }
+                let sources = await trace.sources
+                if !sources.isEmpty { sourceNotice = "Sources: \(sources.joined(separator: ", ")). Streaming availability is unknown." }
             } catch { self.error = "Chat couldn’t respond: \(error.localizedDescription)" }
+            isResponding = false
+        }
+    }
+    /// Select only from catalog titles; the model never gets to invent a recommendation.
+    func planMovieNight() {
+        guard #available(macOS 26.0, *), !isResponding else { return }
+        guard SystemLanguageModel.default.availability == .available else {
+            error = "Apple Intelligence is unavailable on this Mac."
+            return
+        }
+        let preference = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = preference.isEmpty ? "a light movie night" : preference
+        let configured = credential
+        draft = ""; error = nil; sourceNotice = nil; isResponding = true
+        messages.append(ChatMessage(isUser: true, text: "Movie night: " + request))
+        Task {
+            do {
+                let catalog: any FilmCatalog = configured.map { TMDBClient(credential: $0) } ?? SampleCatalog()
+                let films = try await catalog.films(on: configured == nil ? .trending : .popular)
+                let candidates = Array(films.prefix(12))
+                guard !candidates.isEmpty else { throw MovieNightFailure.noCandidates }
+                let candidateLines = candidates.map { film in
+                    let context = String(film.overview.prefix(320)).replacingOccurrences(of: "\n", with: " ")
+                    return "- \(film.title): \(context)"
+                }
+                let workflow = Workflow("Movie night", output: "result") {
+                    Step.prompt("suggestion", "Choose a film from the candidate list that fits the preference. If none fits, return NO_MATCH. Otherwise return ONLY its exact title, with no explanation or punctuation. Never invent a title. {{input}}", model: .appleOnDevice).withPolicy(.localOnly)
+                    Step.template("result", "{{suggestion}}")
+                }
+                let input = "Preference: \(request)\nCandidates (title and description):\n" + candidateLines.joined(separator: "\n")
+                let execution = WorkflowExecutor().execute(workflow, input: .text(input), limits: .init(maxModelCalls: 1, maxToolCalls: 0, maxConcurrentSteps: 1))
+                let report = try await execution.result
+                let output = report.output.textValue.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”"))
+                if output.uppercased() == "NO_MATCH" { throw MovieNightFailure.noMatch }
+                guard let selected = candidates.first(where: { $0.title.caseInsensitiveCompare(output) == .orderedSame }) else { throw MovieNightFailure.ungrounded }
+                messages.append(ChatMessage(isUser: false, text: "Try \(selected.title)" + (selected.year.map { " (\($0))" } ?? "") + "."))
+                sourceNotice = configured == nil ? "Screen Room sample catalog · streaming availability unknown" : "TMDB catalog · streaming availability unknown"
+            } catch {
+                self.error = (error as? MovieNightFailure)?.localizedDescription ?? (error as? ScreenRoomError)?.localizedDescription ?? "Couldn’t plan movie night. Check the connection and try again."
+            }
             isResponding = false
         }
     }
     func clear() { guard !isResponding else { return }; messages = []; modelSession = nil; error = nil; sourceNotice = nil }
 }
 
+private enum MovieNightFailure: LocalizedError {
+    case noCandidates, noMatch, ungrounded
+    var errorDescription: String? {
+        switch self {
+        case .noCandidates: "The film catalog returned no candidates."
+        case .noMatch: "No close match among the current catalog picks. Try a different preference."
+        case .ungrounded: "The model did not choose a catalog title. Try again."
+        }
+    }
+}
+
 actor MovieSearchTrace {
-    private(set) var source: String?
-    func reset() { source = nil }
-    func mark(_ source: String) { self.source = source }
+    private(set) var sources: [String] = []
+    func reset() { sources = [] }
+    func mark(_ source: String) { if !sources.contains(source) { sources.append(source) } }
 }
 
 @available(macOS 26.0, *)
@@ -93,6 +160,26 @@ struct MovieSearchTool: Tool {
     }
 }
 
+@available(macOS 26.0, *)
+struct TVNowPlayingTool: Tool {
+    let name = "tvNowPlaying"
+    let description = "Read the connected Fire TV's active title and playback state."
+    let address: String?
+    let trace: MovieSearchTrace
+    @Generable struct Arguments {
+        @Guide(description: "Whether to include the current playback state")
+        var includePlaybackState: Bool
+    }
+    func call(arguments: Arguments) async throws -> String {
+        guard let address, let playing = await TVMediaSession.read(address: address) else {
+            await trace.mark("Fire TV media session")
+            return "No active title could be read from the Fire TV. Do not guess."
+        }
+        await trace.mark("Fire TV media session")
+        return "TV reports: \(playing.title). Playback: \(playing.state)."
+    }
+}
+
 struct MovieChatView: View {
     @ObservedObject var chat: MovieChat
     @Environment(\.dismiss) private var dismiss
@@ -104,6 +191,7 @@ struct MovieChatView: View {
                     Text(chat.availability).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Movie Night") { chat.planMovieNight() }.disabled(chat.isResponding)
                 Button("New Chat") { chat.clear() }.disabled(chat.isResponding)
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }
@@ -112,7 +200,7 @@ struct MovieChatView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         if chat.messages.isEmpty {
-                            Text("Ask for a film suggestion or talk about a movie. A film search may send your query to TMDB. Chat can’t see Netflix or verify streaming availability.")
+                            Text("Ask for a film suggestion or talk about a movie. A film search may send your query to TMDB. Chat can read the TV’s reported title and send simple commands such as “pause” or “resume”. Mute is a toggle. It cannot verify streaming availability.")
                                 .foregroundStyle(.secondary).padding(.vertical, 16)
                         }
                         ForEach(chat.messages) { message in

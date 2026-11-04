@@ -1,5 +1,8 @@
 import SwiftUI
 import AppKit
+import FoundationModels
+import UniformTypeIdentifiers
+import ScreenRoomKit
 
 #if SWIFT_PACKAGE
 private let assetBundle = Bundle.module
@@ -11,8 +14,14 @@ private let assetBundle = Bundle.main
     @Published var address = UserDefaults.standard.string(forKey: "tvAddress") ?? ""
     @Published var connected = false
     @Published var message = "Checking connection…"
+    @Published var nowPlaying: TVNowPlaying?
+    @Published var nowPlayingStatus = "Refresh to check the TV."
     @Published var screenshot: NSImage?
     @Published var showingScreen = false
+    @Published var screenshotData: Data?
+    @Published var screenDescription: String?
+    @Published var describingScreen = false
+    private var screenRevision = UUID()
     private let adb = (FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/adb") ? "/opt/homebrew/bin/adb" : "/usr/local/bin/adb")
     private func run(_ args: [String], completion: @escaping (Data?, String?) -> Void) {
         let binary = adb
@@ -36,6 +45,19 @@ private let assetBundle = Bundle.main
             guard self.address == requestedAddress else { return }
             self.connected = error == nil && String(data: data ?? Data(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) == "device"
             self.message = self.connected ? "Connected to \(requestedAddress)" : "Not connected. Pair this TV with ADB first."
+            if self.connected { self.refreshNowPlaying() }
+            else { self.nowPlaying = nil; self.nowPlayingStatus = "TV not connected." }
+        }
+    }
+    func refreshNowPlaying() {
+        guard connected else { nowPlaying = nil; nowPlayingStatus = "TV not connected."; return }
+        let target = address
+        nowPlayingStatus = "Checking the TV…"
+        Task {
+            let result = await TVMediaSession.read(address: target)
+            guard address == target, connected else { return }
+            nowPlaying = result
+            nowPlayingStatus = result == nil ? "No active title reported by the TV." : "From the TV · checked just now"
         }
     }
     func connect() {
@@ -88,7 +110,48 @@ private let assetBundle = Bundle.main
         message = "Getting TV screen…"
         run(["-s", address + ":5555", "exec-out", "screencap", "-p"]) { data, error in
             guard error == nil, let data, let image = NSImage(data: data) else { self.message = "Screen unavailable. This app may block capture."; return }
-            self.screenshot = image; self.showingScreen = true; self.message = "TV screen captured"
+            self.screenRevision = UUID()
+            self.screenshot = image; self.screenshotData = data
+            self.screenDescription = nil; self.showingScreen = true; self.message = "TV screen captured"
+        }
+    }
+    func saveScreenshot() {
+        guard let data = screenshotData else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "Fire TV screenshot.png"
+        panel.begin { result in
+            guard result == .OK, let url = panel.url else { return }
+            do { try data.write(to: url, options: .atomic) }
+            catch { Task { @MainActor in self.message = "Couldn’t save screenshot." } }
+        }
+    }
+    func describeScreenshot() {
+        guard !describingScreen, let image = screenshot,
+              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        let model = SystemLanguageModel.default
+        guard model.availability == .available, model.capabilities.contains(.vision) else {
+            screenDescription = "Image understanding is unavailable on this Mac."
+            return
+        }
+        let revision = screenRevision
+        describingScreen = true
+        screenDescription = nil
+        Task {
+            defer { describingScreen = false }
+            do {
+                let session = LanguageModelSession(model: model, instructions: """
+                    Describe only what is visible on the supplied TV screenshot. Read visible text accurately.
+                    Do not infer a movie title, identity, playback state, or unavailable content. If uncertain, say so.
+                    """)
+                let result = try await session.respond {
+                    "Briefly describe the visible screen and any readable controls or text."
+                    Attachment(cgImage)
+                }
+                if revision == screenRevision { screenDescription = result.content }
+            } catch {
+                if revision == screenRevision { screenDescription = "Couldn’t describe this screen. Try again." }
+            }
         }
     }
 }
@@ -109,21 +172,29 @@ struct ContentView: View {
     @StateObject private var films = FilmSearch()
     @StateObject private var chat = MovieChat()
     @State private var showingChat = false
-    private let panels: [(String,String,String)] = [("comedy","Feel-Good Comedies","Light, funny, and uplifting"),("romance","Romantic Comedies","Love, laughs, and happily ever after"),("escape","Escape & Dream","Feel-good stories in beautiful places"),("notable","New & Notable","Fresh picks to watch now")]
+    private let sampleArtwork = ["comedy", "romance", "escape", "notable"]
     var body: some View {
-        HStack(spacing: 0) { sidebar; main }.background(Color(red: 0.15, green: 0.105, blue: 0.15)).foregroundStyle(.white)
+        HStack(spacing: 0) { sidebar; main }.background(Color(red: 0.15, green: 0.105, blue: 0.15)).foregroundStyle(.white).onAppear { films.loadFeatured() }
         .sheet(isPresented: $showYouTube) {
             VStack(alignment: .leading, spacing: 14) {
                 Text("YouTube on Fire TV").font(.title2.bold())
                 Text("Open YouTube or send a specific video link to the TV. Availability and playback depend on YouTube.").foregroundStyle(.secondary)
                 TextField("https://www.youtube.com/watch?v=…", text: $youtubeLink).textFieldStyle(.roundedBorder)
-                HStack { Button("Open YouTube") { tv.openYouTube(); showYouTube = false }; Button("Open Video") { tv.openYouTubeVideo(youtubeLink); showYouTube = false }.disabled(YouTubeLink.videoID(youtubeLink) == nil); Spacer(); Button("Done") { showYouTube = false } }
-                Text("Your browsing history is not connected.").font(.caption).foregroundStyle(.secondary)
+                HStack { Button("Open YouTube") { tv.openYouTube(); showYouTube = false }; Button("Send Video Link") { tv.openYouTubeVideo(youtubeLink); showYouTube = false }.disabled(YouTubeLink.videoID(youtubeLink) == nil); Spacer(); Button("Done") { showYouTube = false } }
+                Text("Link handling varies by TV and may not start playback. Your browsing history is not connected.").font(.caption).foregroundStyle(.secondary)
             }.padding(24).frame(width: 530)
         }
         .sheet(isPresented: $films.showing) { FilmSearchView(films: films).environmentObject(tv) }
         .sheet(isPresented: $showingChat) { MovieChatView(chat: chat) }
-        .sheet(isPresented: $tv.showingScreen) { VStack(alignment: .trailing) { Button("Done") { tv.showingScreen = false }; if let image = tv.screenshot { Image(nsImage: image).resizable().scaledToFit() } }.padding().frame(minWidth: 720, minHeight: 450) }
+         .sheet(isPresented: $tv.showingScreen) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack { Text("TV Screenshot").font(.title2.bold()); Spacer(); Button("Save…") { tv.saveScreenshot() }; Button("Done") { tv.showingScreen = false } }
+                if let image = tv.screenshot { Image(nsImage: image).resizable().scaledToFit().frame(maxWidth: .infinity, maxHeight: 430) }
+                HStack { Button("Describe with Apple Intelligence") { tv.describeScreenshot() }.disabled(tv.describingScreen); if tv.describingScreen { ProgressView().controlSize(.small) }; Spacer(); Text("Processed on this Mac").font(.caption).foregroundStyle(.secondary) }
+                if let description = tv.screenDescription { ScrollView { Text(description).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 120) }
+                Text("Some apps block screenshots. A description can be inaccurate.").font(.caption).foregroundStyle(.secondary)
+            }.padding(20).frame(minWidth: 720, minHeight: 450)
+        }
     }
     var sidebar: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -137,6 +208,10 @@ struct ContentView: View {
             }.frame(width:220,height:220).frame(maxWidth:.infinity)
             HStack(spacing:22) { roundButton("Home","house","KEYCODE_HOME"); roundButton("Back","arrow.uturn.backward","KEYCODE_BACK") }.frame(maxWidth:.infinity)
             Button { tv.button("KEYCODE_MEDIA_PLAY_PAUSE") } label: { Label("Play / Pause",systemImage:"playpause.fill").font(.system(size:15,weight:.medium)).frame(maxWidth:.infinity).frame(height:64).background(buttonGradient,in:Capsule()).overlay(Capsule().stroke(.white.opacity(0.14))).shadow(color:.black.opacity(0.5),radius:8,y:5) }.buttonStyle(.plain)
+            HStack {
+                Button("Resume", systemImage: "play.fill") { tv.button("KEYCODE_MEDIA_PLAY") }
+                Button("Forward", systemImage: "goforward") { tv.button("KEYCODE_MEDIA_FAST_FORWARD") }
+            }.buttonStyle(.bordered).frame(maxWidth: .infinity)
             Spacer(minLength: 4)
             Divider().overlay(.white.opacity(0.1))
             featureRow("Siri Shortcuts", "TV Connection", "sparkles")
@@ -144,23 +219,68 @@ struct ContentView: View {
         }.padding(.horizontal,25).padding(.bottom,24).frame(width:300).background(Color(red:0.17,green:0.13,blue:0.17))
     }
     var main: some View {
-        VStack(alignment:.leading,spacing:22) {
-            HStack(spacing:15) {
-                Image(systemName:"tv").font(.system(size:32))
-                VStack(alignment:.leading,spacing:5) { Text(tv.connected ? "TV Connected" : "TV Disconnected").font(.system(size:21,weight:.bold)); HStack(spacing:6) { Circle().fill(tv.connected ? .green : .orange).frame(width:8,height:8); Text(tv.message).lineLimit(1).font(.system(size:12)).foregroundStyle(.white.opacity(0.65)) } }
+        ScrollView { VStack(alignment:.leading,spacing:22) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    Image(systemName:"tv").font(.system(size:26))
+                    VStack(alignment:.leading,spacing:3) {
+                        Text(tv.connected ? "TV Connected" : "TV Disconnected").font(.system(size:19,weight:.bold))
+                        HStack(spacing:6) { Circle().fill(tv.connected ? .green : .orange).frame(width:8,height:8); Text(tv.message).lineLimit(1).font(.system(size:12)).foregroundStyle(.white.opacity(0.65)) }
+                    }
+                    Spacer()
+                    Button { tv.capture() } label: { Label("See TV",systemImage:"tv") }.buttonStyle(.borderedProminent).tint(Color(red:0.48,green:0.32,blue:0.43))
+                }
+                HStack {
+                    TextField("TV address",text:$tv.address).textFieldStyle(.roundedBorder).frame(width:150).onChange(of: tv.address) { tv.connected = false; tv.nowPlaying = nil; tv.nowPlayingStatus = "TV address changed."; tv.message = "Address changed. Select Connect." }.onSubmit { tv.connect() }
+                    Button("Connect") { tv.connect() }
+                    Button("Netflix") { tv.openNetflix() }
+                    Button("YouTube") { showYouTube = true }
+                    Spacer()
+                }.buttonStyle(.bordered)
+            }.padding(16).background(.white.opacity(0.035),in:RoundedRectangle(cornerRadius:18)).overlay(RoundedRectangle(cornerRadius:18).stroke(.white.opacity(0.07)))
+            HStack(spacing: 12) {
+                Image(systemName: "play.tv").font(.title3)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(tv.nowPlaying?.title ?? "Nothing reported by the TV").font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                    Text(tv.nowPlaying.map { $0.state + ($0.artist.map { " · " + $0 } ?? "") } ?? tv.nowPlayingStatus).font(.caption).foregroundStyle(.white.opacity(0.65)).lineLimit(1)
+                }
                 Spacer()
-                TextField("TV address",text:$tv.address).textFieldStyle(.roundedBorder).frame(width:125).onChange(of: tv.address) { tv.connected = false; tv.message = "Address changed. Select Connect." }.onSubmit { tv.connect() }
-                Button("Connect") { tv.connect() }.buttonStyle(.bordered)
-                Button("Netflix") { tv.openNetflix() }.buttonStyle(.bordered)
-                Button("YouTube") { showYouTube = true }.buttonStyle(.bordered)
-                Button { tv.capture() } label: { Label("See TV",systemImage:"tv") }.buttonStyle(.borderedProminent).tint(Color(red:0.48,green:0.32,blue:0.43))
-            }.padding(18).background(.white.opacity(0.035),in:RoundedRectangle(cornerRadius:18)).overlay(RoundedRectangle(cornerRadius:18).stroke(.white.opacity(0.07)))
+                Button { tv.button("KEYCODE_VOLUME_DOWN") } label: { Image(systemName:"speaker.minus") }.help("Volume down").accessibilityLabel("Volume down")
+                Button { tv.button("KEYCODE_VOLUME_MUTE") } label: { Image(systemName:"speaker.slash") }.help("Mute or unmute").accessibilityLabel("Mute or unmute")
+                Button { tv.button("KEYCODE_VOLUME_UP") } label: { Image(systemName:"speaker.plus") }.help("Volume up").accessibilityLabel("Volume up")
+                Button("Refresh") { tv.refreshNowPlaying() }.disabled(!tv.connected)
+            }.padding(12).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
             HStack { Image(systemName:"magnifyingglass"); TextField("Search film titles",text:$search).textFieldStyle(.plain).onSubmit { films.query = search; films.showing = true; films.search() }; Button("Search") { films.query = search; films.showing = true; films.search() }.buttonStyle(.plain).font(.subheadline.bold()) }.font(.system(size:19)).padding(16).background(Color(red:0.25,green:0.18,blue:0.24),in:RoundedRectangle(cornerRadius:20)).overlay(RoundedRectangle(cornerRadius:20).stroke(.pink.opacity(0.45)))
-            VStack(alignment:.leading,spacing:4) { Text("Discover Movies").font(.system(size:28,weight:.bold)); Text("Handpicked ideas for your next movie night.").foregroundStyle(.white.opacity(0.65)); Text("Preview categories · Press Return to search Screen Room’s catalog").font(.caption).foregroundStyle(.white.opacity(0.45)) }
-            GeometryReader { geometry in let width = max(100, (geometry.size.width - 48) / 4); HStack(alignment:.top,spacing:16) { ForEach(panels,id:\.0) { panel in VStack(alignment:.leading,spacing:7) { if let url = assetBundle.url(forResource: panel.0, withExtension:"png"), let image = NSImage(contentsOf:url) { Image(nsImage:image).resizable().aspectRatio(contentMode:.fill).frame(width:width,height:190).clipped().clipShape(RoundedRectangle(cornerRadius:16)) }; Text(panel.1).font(.system(size:15,weight:.bold)).lineLimit(1).minimumScaleFactor(0.8); Text(panel.2).font(.system(size:13)).foregroundStyle(.white.opacity(0.7)).lineLimit(2) }.frame(width:width,alignment:.leading) } } }.frame(height:260)
+            VStack(alignment:.leading,spacing:4) {
+                HStack { Text("Discover Movies").font(.system(size:28,weight:.bold)); Spacer(); Button("Refresh") { films.loadFeatured() }.disabled(films.isLoadingFeatured) }
+                Text(films.featuredStatus).foregroundStyle(.white.opacity(0.65))
+                Text("Catalog titles do not confirm streaming availability.").font(.caption).foregroundStyle(.white.opacity(0.45))
+            }
+            GeometryReader { geometry in
+                let width = max(100, (geometry.size.width - 48) / 4)
+                HStack(alignment:.top,spacing:16) {
+                    ForEach(Array(films.featured.enumerated()), id: \.element.id) { index, film in
+                        Button {
+                            films.query = film.title; films.showing = true; films.search()
+                        } label: {
+                            VStack(alignment:.leading,spacing:7) {
+                                Group {
+                                    if let url = TMDBImage.url(path: film.posterPath, size: .poster) {
+                                        AsyncImage(url: url) { image in image.resizable().aspectRatio(contentMode:.fill) } placeholder: { Color.white.opacity(0.06) }
+                                    } else if let url = assetBundle.url(forResource: sampleArtwork[index % sampleArtwork.count], withExtension:"png"), let image = NSImage(contentsOf:url) {
+                                        Image(nsImage:image).resizable().aspectRatio(contentMode:.fill)
+                                    } else { Color.white.opacity(0.06) }
+                                }.frame(width:width,height:190).clipped().clipShape(RoundedRectangle(cornerRadius:16))
+                                Text(film.title).font(.system(size:15,weight:.bold)).lineLimit(1).minimumScaleFactor(0.8)
+                                Text(film.year ?? "Year unavailable").font(.system(size:13)).foregroundStyle(.white.opacity(0.7))
+                            }.frame(width:width,alignment:.leading).contentShape(Rectangle())
+                        }.buttonStyle(.plain)
+                    }
+                }
+            }.frame(height:240)
             Spacer(minLength:0)
-            HStack(spacing:16) { Image(systemName:"bubble.left").font(.title2).padding(15).background(.white.opacity(0.07),in:Circle()); VStack(alignment:.leading,spacing:5) { Text("Movie Chat").font(.system(size:18,weight:.bold)); Text("Find something to watch, get suggestions, or plan a movie night.").font(.system(size:13)).foregroundStyle(.white.opacity(0.65)); Text("On-device text chat · Voice coming later").font(.caption).foregroundStyle(.white.opacity(0.5)) }; Spacer(); Image(systemName:"waveform").font(.system(size:38)).foregroundStyle(.pink.opacity(0.55)); Button { chat.configure(credential: films.activeCredential); showingChat = true } label: { Image(systemName:"bubble.left.fill").font(.title2).padding(16).background(buttonGradient,in:Circle()) }.buttonStyle(.plain).accessibilityLabel("Open movie chat") }.padding(18).background(.white.opacity(0.04),in:RoundedRectangle(cornerRadius:18)).overlay(RoundedRectangle(cornerRadius:18).stroke(.white.opacity(0.07)))
-        }.padding(24)
+            HStack(spacing:16) { Image(systemName:"bubble.left").font(.title2).padding(15).background(.white.opacity(0.07),in:Circle()); VStack(alignment:.leading,spacing:5) { Text("Movie Chat").font(.system(size:18,weight:.bold)); Text("Find something to watch, get suggestions, or plan a movie night.").font(.system(size:13)).foregroundStyle(.white.opacity(0.65)); Text("On-device text chat · Voice coming later").font(.caption).foregroundStyle(.white.opacity(0.5)) }; Spacer(); Image(systemName:"waveform").font(.system(size:38)).foregroundStyle(.pink.opacity(0.55)); Button { chat.configure(credential: films.activeCredential, tvAddress: tv.connected ? tv.address : nil); showingChat = true } label: { Image(systemName:"bubble.left.fill").font(.title2).padding(16).background(buttonGradient,in:Circle()) }.buttonStyle(.plain).accessibilityLabel("Open movie chat") }.padding(18).background(.white.opacity(0.04),in:RoundedRectangle(cornerRadius:18)).overlay(RoundedRectangle(cornerRadius:18).stroke(.white.opacity(0.07)))
+        }.padding(24).frame(maxWidth: .infinity, alignment: .leading) }
     }
     var buttonGradient: LinearGradient { LinearGradient(colors:[Color(red:0.38,green:0.29,blue:0.37),Color(red:0.17,green:0.12,blue:0.17)],startPoint:.topLeading,endPoint:.bottomTrailing) }
     func direction(_ icon:String,_ key:String)->some View { Button { tv.button(key) } label:{ Image(systemName:icon).font(.system(size:20,weight:.medium)).frame(width:44,height:35).contentShape(Rectangle()) }.buttonStyle(.plain).accessibilityLabel(key.replacingOccurrences(of:"KEYCODE_DPAD_",with:"")) }
