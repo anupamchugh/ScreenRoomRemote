@@ -2,6 +2,8 @@
 
 A local macOS prototype for controlling a compatible Fire OS device, looking up films and chatting about movies. Built with SwiftUI, App Intents and Apple Foundation Models.
 
+![Movie Chat on macOS showing a movie-night suggestion](docs/images/movie-chat-macos.png)
+
 ## What works
 
 - Home, Back, directional, Select, Play/Pause, Resume, Forward and volume-key commands over a paired ADB connection. TV and audio hardware support varies.
