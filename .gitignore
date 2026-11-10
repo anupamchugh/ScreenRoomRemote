@@ -4,3 +4,7 @@ build.log
 dist/
 *.xcodeproj/
 .DS_Store
+
+# Beads ledger (local only)
+.beads/
+.beads.gate.lock
